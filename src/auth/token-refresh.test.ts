@@ -92,6 +92,7 @@ describe('createTokenRefreshProvider', () => {
 
     const newToken = {
       accessToken: 'new-access-token',
+      idToken: 'new-id-token',
       refreshToken: 'new-refresh-token',
       expiresAt: Date.now() + 3600000
     };
@@ -103,7 +104,11 @@ describe('createTokenRefreshProvider', () => {
     const provider = createTokenRefreshProvider('https://argocd.example.com');
     const result = await provider.refreshToken();
 
-    expect(result).toBe('new-access-token');
+    // ArgoCD validates the bearer credential's `aud` claim against its own
+    // client ID, which the OIDC spec only guarantees on the ID token -- not
+    // the access token. See the id-token fix in mcp-oauth-provider.ts /
+    // transport.ts for the full rationale.
+    expect(result).toBe('new-id-token');
     expect(fetchOIDCProviderMetadata).toHaveBeenCalledWith(storedAuth.oidcConfig);
     expect(refreshAccessToken).toHaveBeenCalledWith(
       providerMetadata,
@@ -115,6 +120,44 @@ describe('createTokenRefreshProvider', () => {
       newToken,
       storedAuth.oidcConfig
     );
+  });
+
+  it('should return null when refresh response has no ID token', async () => {
+    const storedAuth = {
+      serverUrl: 'https://argocd.example.com',
+      token: {
+        accessToken: 'old-access-token',
+        refreshToken: 'refresh-token'
+      },
+      oidcConfig: {
+        issuer: 'https://issuer.example.com',
+        clientID: 'client-id',
+        scopes: ['openid'],
+        enablePKCEAuthentication: false,
+        useDex: false
+      },
+      storedAt: Date.now()
+    };
+
+    const providerMetadata = {
+      issuer: 'https://issuer.example.com',
+      authorization_endpoint: 'https://issuer.example.com/auth',
+      token_endpoint: 'https://issuer.example.com/token'
+    };
+
+    vi.mocked(loadToken).mockResolvedValue(storedAuth);
+    vi.mocked(fetchOIDCProviderMetadata).mockResolvedValue(providerMetadata);
+    vi.mocked(refreshAccessToken).mockResolvedValue({
+      accessToken: 'new-access-token',
+      refreshToken: 'new-refresh-token',
+      expiresAt: Date.now() + 3600000
+      // no idToken
+    });
+
+    const provider = createTokenRefreshProvider('https://argocd.example.com');
+    const result = await provider.refreshToken();
+
+    expect(result).toBeNull();
   });
 
   it('should return null and log error when refresh fails', async () => {

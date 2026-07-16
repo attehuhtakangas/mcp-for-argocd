@@ -24,8 +24,14 @@ interface AuthConfig {
 }
 
 /**
- * Attempt to refresh an expired token at startup
- * Returns the new access token if successful, null otherwise
+ * Attempt to refresh an expired token at startup.
+ * Returns the new ID token if successful, null otherwise. ArgoCD's own
+ * server validates the bearer credential as an OIDC RP: it checks the JWT's
+ * `aud` claim against its configured client ID, which the spec only
+ * guarantees for the ID token -- an access token's audience is
+ * provider-defined (Okta's, for example, is the authorization server
+ * itself) and ArgoCD rejects it with "invalid session: failed to verify the
+ * token".
  */
 async function tryRefreshExpiredToken(storedAuth: StoredAuth): Promise<string | null> {
   // First, try token refresh if we have a refresh token
@@ -48,7 +54,14 @@ async function tryRefreshExpiredToken(storedAuth: StoredAuth): Promise<string | 
         );
         await saveToken(storedAuth.serverUrl, newToken, oidcConfig);
         logger.info({ serverUrl: storedAuth.serverUrl }, 'Token refreshed successfully at startup');
-        return newToken.accessToken;
+        if (!newToken.idToken) {
+          logger.warn(
+            { serverUrl: storedAuth.serverUrl },
+            'Refresh response had no ID token; re-run `argocd-mcp login` to re-authenticate.'
+          );
+          return null;
+        }
+        return newToken.idToken;
       } catch {
         // If refresh fails, try re-fetching OIDC settings from server (config may have changed)
         logger.debug(
@@ -70,7 +83,14 @@ async function tryRefreshExpiredToken(storedAuth: StoredAuth): Promise<string | 
           { serverUrl: storedAuth.serverUrl },
           'Token refreshed successfully with updated OIDC config'
         );
-        return newToken.accessToken;
+        if (!newToken.idToken) {
+          logger.warn(
+            { serverUrl: storedAuth.serverUrl },
+            'Refresh response had no ID token; re-run `argocd-mcp login` to re-authenticate.'
+          );
+          return null;
+        }
+        return newToken.idToken;
       }
     } catch (error) {
       logger.warn(
@@ -108,13 +128,16 @@ async function resolveAuth(options?: { serverUrl?: string }): Promise<AuthConfig
   if (options?.serverUrl) {
     const storedAuth = await loadToken(options.serverUrl);
     if (storedAuth) {
-      let accessToken = storedAuth.token.accessToken;
+      // ArgoCD validates the bearer credential's `aud` claim against its own
+      // client ID, which is only guaranteed to match the ID token -- not the
+      // access token (see tryRefreshExpiredToken above).
+      let idToken = storedAuth.token.idToken;
 
       if (isTokenExpired(storedAuth.token)) {
         // Try to refresh the expired token
         const refreshedToken = await tryRefreshExpiredToken(storedAuth);
         if (refreshedToken) {
-          accessToken = refreshedToken;
+          idToken = refreshedToken;
         } else {
           logger.warn(
             { serverUrl: options.serverUrl },
@@ -124,10 +147,18 @@ async function resolveAuth(options?: { serverUrl?: string }): Promise<AuthConfig
         }
       }
 
+      if (!idToken) {
+        logger.warn(
+          { serverUrl: options.serverUrl },
+          'Stored auth has no ID token. Please run `argocd-mcp login` to re-authenticate.'
+        );
+        return null;
+      }
+
       logger.info({ serverUrl: options.serverUrl }, 'Using stored authentication token');
       return {
         baseUrl: storedAuth.serverUrl,
-        apiToken: accessToken,
+        apiToken: idToken,
         isSSOAuth: true
       };
     }
@@ -138,13 +169,13 @@ async function resolveAuth(options?: { serverUrl?: string }): Promise<AuthConfig
   // Priority 3: Default stored token (first stored server)
   const defaultAuth = await getDefaultServer();
   if (defaultAuth) {
-    let accessToken = defaultAuth.token.accessToken;
+    let idToken = defaultAuth.token.idToken;
 
     if (isTokenExpired(defaultAuth.token)) {
       // Try to refresh the expired token
       const refreshedToken = await tryRefreshExpiredToken(defaultAuth);
       if (refreshedToken) {
-        accessToken = refreshedToken;
+        idToken = refreshedToken;
       } else {
         logger.warn(
           { serverUrl: defaultAuth.serverUrl },
@@ -154,10 +185,18 @@ async function resolveAuth(options?: { serverUrl?: string }): Promise<AuthConfig
       }
     }
 
+    if (!idToken) {
+      logger.warn(
+        { serverUrl: defaultAuth.serverUrl },
+        'Stored auth has no ID token. Please run `argocd-mcp login` to re-authenticate.'
+      );
+      return null;
+    }
+
     logger.info({ serverUrl: defaultAuth.serverUrl }, 'Using default stored authentication token');
     return {
       baseUrl: defaultAuth.serverUrl,
-      apiToken: accessToken,
+      apiToken: idToken,
       isSSOAuth: true
     };
   }
