@@ -68,14 +68,19 @@ export async function performSSOLogin(
   const providerMetadata = await fetchOIDCProviderMetadata(oidcConfig);
   logger.info('OIDC provider metadata loaded');
 
-  // Step 3: Generate state and PKCE challenge
+  // Step 3: Generate state and PKCE challenge.
+  //
+  // Always generate one, rather than gating on ArgoCD's own
+  // oidcConfig.enablePKCEAuthentication setting. That flag reflects whether
+  // ArgoCD's admin opted into PKCE -- it says nothing about whether the
+  // identity provider itself requires it. Okta (and others) commonly enforce
+  // PKCE for public/native OAuth clients regardless of what ArgoCD's config
+  // says, and omitting a required challenge hard-fails the login ("PKCE code
+  // challenge is required by the application"), whereas sending an unneeded
+  // one is harmless.
   const state = generateState();
-  let pkce: PKCEChallenge | undefined;
-
-  if (oidcConfig.enablePKCEAuthentication) {
-    pkce = generatePKCEChallenge();
-    logger.info('PKCE challenge generated');
-  }
+  const pkce: PKCEChallenge = generatePKCEChallenge();
+  logger.info('PKCE challenge generated');
 
   // Step 4: Build redirect URI and authorization URL
   const redirectUri = getRedirectUri(port);

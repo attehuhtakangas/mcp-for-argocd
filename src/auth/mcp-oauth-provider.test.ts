@@ -28,7 +28,7 @@ vi.mock('../logging/logging.js', () => ({
 }));
 
 import { fetchOIDCSettings, fetchOIDCProviderMetadata } from './settings.js';
-import { buildAuthorizationUrl, exchangeCodeForToken } from './oauth.js';
+import { buildAuthorizationUrl, exchangeCodeForToken, refreshAccessToken } from './oauth.js';
 
 const mockOidcConfig = {
   issuer: 'https://dex.example.com',
@@ -150,6 +150,123 @@ describe('ArgocdOAuthProvider', () => {
 
       const result = await store.getClient('nonexistent');
       expect(result).toBeUndefined();
+    });
+  });
+
+  describe('verifyAccessToken', () => {
+    // Drives a real authorize -> handleUpstreamCallback -> exchangeAuthorizationCode
+    // flow to get a real opaque token, rather than reaching into the class's
+    // private state -- verifyAccessToken's behavior only matters in terms of
+    // what a caller going through the real flow would observe.
+    async function issueOpaqueToken(provider: ArgocdOAuthProvider, argocdToken: {
+      idToken: string;
+      refreshToken?: string;
+      expiresAt?: number;
+    }) {
+      vi.mocked(exchangeCodeForToken).mockResolvedValue({
+        accessToken: 'upstream-access-token',
+        idToken: argocdToken.idToken,
+        refreshToken: argocdToken.refreshToken,
+        expiresAt: argocdToken.expiresAt
+      });
+
+      const mockRes = { redirect: vi.fn() } as any;
+      await provider.authorize(
+        { client_id: 'test-client', client_id_issued_at: 0, redirect_uris: ['http://localhost/callback'] } as any,
+        { redirectUri: 'http://localhost/callback', codeChallenge: 'challenge', state: 'client-state' } as any,
+        mockRes
+      );
+      const redirectUrl = await provider.handleUpstreamCallback('upstream-code', 'mock-upstream-state');
+      const ourAuthCode = new URL(redirectUrl).searchParams.get('code')!;
+
+      const tokens = await provider.exchangeAuthorizationCode(
+        { client_id: 'test-client', client_id_issued_at: 0, redirect_uris: ['http://localhost/callback'] } as any,
+        ourAuthCode
+      );
+      return tokens;
+    }
+
+    it('does not refresh, and reports a long-lived expiry, when the upstream token is still fresh', async () => {
+      const provider = new ArgocdOAuthProvider('https://argocd.example.com');
+      const tokens = await issueOpaqueToken(provider, {
+        idToken: 'fresh-id-token',
+        refreshToken: 'upstream-refresh-token',
+        expiresAt: Date.now() + 3600_000 // fresh for another hour
+      });
+
+      const authInfo = await provider.verifyAccessToken(tokens.access_token);
+
+      expect(refreshAccessToken).not.toHaveBeenCalled();
+      expect(authInfo.extra?.argocdToken).toBe('fresh-id-token');
+      // Reported expiry is the long opaque-session TTL, not the ~1hr
+      // upstream expiry -- this is the actual fix: the MCP SDK's
+      // requireBearerAuth 401s outright once this passes, so it must not
+      // mirror the upstream token's short lifetime.
+      const oneDayFromNowSeconds = Math.floor((Date.now() + 24 * 60 * 60 * 1000) / 1000);
+      expect(authInfo.expiresAt).toBeGreaterThan(oneDayFromNowSeconds);
+    });
+
+    it('silently refreshes the upstream token when it is stale, without the caller doing anything', async () => {
+      const provider = new ArgocdOAuthProvider('https://argocd.example.com');
+      const tokens = await issueOpaqueToken(provider, {
+        idToken: 'stale-id-token',
+        refreshToken: 'upstream-refresh-token',
+        expiresAt: Date.now() - 1000 // already expired
+      });
+
+      vi.mocked(refreshAccessToken).mockResolvedValue({
+        accessToken: 'new-upstream-access-token',
+        idToken: 'refreshed-id-token',
+        refreshToken: 'new-upstream-refresh-token',
+        expiresAt: Date.now() + 3600_000
+      });
+
+      const authInfo = await provider.verifyAccessToken(tokens.access_token);
+
+      expect(refreshAccessToken).toHaveBeenCalledWith(
+        mockProviderMetadata,
+        mockOidcConfig,
+        'upstream-refresh-token'
+      );
+      expect(authInfo.extra?.argocdToken).toBe('refreshed-id-token');
+
+      // A second call shouldn't refresh again -- the refreshed token is now
+      // fresh, so the updated state must actually be persisted, not just
+      // returned once.
+      vi.mocked(refreshAccessToken).mockClear();
+      const secondCall = await provider.verifyAccessToken(tokens.access_token);
+      expect(refreshAccessToken).not.toHaveBeenCalled();
+      expect(secondCall.extra?.argocdToken).toBe('refreshed-id-token');
+    });
+
+    it('throws if the upstream token is stale and there is no refresh token', async () => {
+      const provider = new ArgocdOAuthProvider('https://argocd.example.com');
+      const tokens = await issueOpaqueToken(provider, {
+        idToken: 'stale-id-token',
+        refreshToken: undefined,
+        expiresAt: Date.now() - 1000
+      });
+
+      await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/log in again/);
+      expect(refreshAccessToken).not.toHaveBeenCalled();
+    });
+
+    it('propagates the error if the upstream refresh itself fails', async () => {
+      const provider = new ArgocdOAuthProvider('https://argocd.example.com');
+      const tokens = await issueOpaqueToken(provider, {
+        idToken: 'stale-id-token',
+        refreshToken: 'upstream-refresh-token',
+        expiresAt: Date.now() - 1000
+      });
+
+      vi.mocked(refreshAccessToken).mockRejectedValue(new Error('refresh_token expired or revoked'));
+
+      await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow('refresh_token expired or revoked');
+    });
+
+    it('throws for an unknown token', async () => {
+      const provider = new ArgocdOAuthProvider('https://argocd.example.com');
+      await expect(provider.verifyAccessToken('nonexistent-token')).rejects.toThrow(/Invalid or expired/);
     });
   });
 });
