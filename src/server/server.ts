@@ -10,17 +10,46 @@ import {
   ResourceRefSchema
 } from '../shared/models/schema.js';
 import type { TokenRefreshProvider } from '../auth/token-refresh.js';
+import { createTokenRefreshProvider } from '../auth/token-refresh.js';
+
+export type ResolvedServerAuth = { baseUrl: string; apiToken: string };
 
 type ServerInfo = {
   argocdBaseUrl: string;
   argocdApiToken: string;
   tokenRefreshProvider?: TokenRefreshProvider;
   isAuthenticated?: boolean;
+  // Looks up SSO-stored credentials for an ArgoCD base URL other than this
+  // server's default -- e.g. a second ArgoCD instance logged into via
+  // `argocd-mcp login <url>`. Only wired on the stdio transport today (see
+  // connectStdioTransport); when omitted, tools cannot target another server
+  // and a caller-supplied argocdBaseUrl fails outright.
+  resolveServerAuth?: (serverUrl: string) => Promise<ResolvedServerAuth | null>;
 };
+
+// Per-call argument every tool accepts to target a different ArgoCD instance
+// than this server's configured default.
+const dynamicServerArgsSchema = {
+  argocdBaseUrl: z
+    .string()
+    .optional()
+    .describe(
+      "ArgoCD base URL to target for this call instead of the server default -- e.g. another ArgoCD instance you have already logged into via `argocd-mcp login <url>`. Omit to use this server's configured default."
+    )
+} satisfies ZodRawShape;
+
+type DynamicServerArgs = { argocdBaseUrl?: string };
 
 export class Server extends McpServer {
   private argocdClient: ArgoCDClient;
   private isAuthenticated: boolean;
+  private resolveServerAuth?: (serverUrl: string) => Promise<ResolvedServerAuth | null>;
+  // Caches clients built for a caller-supplied argocdBaseUrl, keyed by that
+  // URL, so a long session doesn't re-resolve on every call. Each cached
+  // client gets its own tokenRefreshProvider, so it self-refreshes on
+  // staleness exactly like the default client does -- no separate expiry
+  // check is needed here on a cache hit.
+  private dynamicClientCache = new Map<string, ArgoCDClient>();
 
   constructor(serverInfo: ServerInfo) {
     super({
@@ -28,6 +57,7 @@ export class Server extends McpServer {
       version: packageJSON.version
     });
     this.isAuthenticated = serverInfo.isAuthenticated ?? true;
+    this.resolveServerAuth = serverInfo.resolveServerAuth;
     this.argocdClient = new ArgoCDClient({
       baseUrl: serverInfo.argocdBaseUrl,
       apiToken: serverInfo.argocdApiToken,
@@ -67,8 +97,8 @@ export class Server extends McpServer {
             'Number of applications to skip before returning results. Use with limit for pagination. Optional.'
           )
       },
-      async ({ search, limit, offset }) =>
-        await this.argocdClient.listApplications({
+      async ({ search, limit, offset }, client) =>
+        await client.listApplications({
           search: search ?? undefined,
           limit,
           offset
@@ -81,15 +111,15 @@ export class Server extends McpServer {
         applicationName: z.string(),
         applicationNamespace: ApplicationNamespaceSchema.optional()
       },
-      async ({ applicationName, applicationNamespace }) =>
-        await this.argocdClient.getApplication(applicationName, applicationNamespace)
+      async ({ applicationName, applicationNamespace }, client) =>
+        await client.getApplication(applicationName, applicationNamespace)
     );
     this.addJsonOutputTool(
       'get_application_resource_tree',
       'get_application_resource_tree returns resource tree for application by application name',
       { applicationName: z.string() },
-      async ({ applicationName }) =>
-        await this.argocdClient.getApplicationResourceTree(applicationName)
+      async ({ applicationName }, client) =>
+        await client.getApplicationResourceTree(applicationName)
     );
     this.addJsonOutputTool(
       'get_application_managed_resources',
@@ -109,7 +139,10 @@ export class Server extends McpServer {
         appNamespace: z.string().optional().describe('Filter by Argo CD application namespace'),
         project: z.string().optional().describe('Filter by Argo CD project')
       },
-      async ({ applicationName, kind, namespace, name, version, group, appNamespace, project }) => {
+      async (
+        { applicationName, kind, namespace, name, version, group, appNamespace, project },
+        client
+      ) => {
         const filters = {
           ...(kind && { kind }),
           ...(namespace && { namespace }),
@@ -119,7 +152,7 @@ export class Server extends McpServer {
           ...(appNamespace && { appNamespace }),
           ...(project && { project })
         };
-        return await this.argocdClient.getApplicationManagedResources(
+        return await client.getApplicationManagedResources(
           applicationName,
           Object.keys(filters).length > 0 ? filters : undefined
         );
@@ -134,8 +167,8 @@ export class Server extends McpServer {
         resourceRef: ResourceRefSchema,
         container: z.string()
       },
-      async ({ applicationName, applicationNamespace, resourceRef, container }) =>
-        await this.argocdClient.getWorkloadLogs(
+      async ({ applicationName, applicationNamespace, resourceRef, container }, client) =>
+        await client.getWorkloadLogs(
           applicationName,
           applicationNamespace,
           resourceRef as V1alpha1ResourceResult,
@@ -146,7 +179,7 @@ export class Server extends McpServer {
       'get_application_events',
       'get_application_events returns events for application by application name',
       { applicationName: z.string() },
-      async ({ applicationName }) => await this.argocdClient.getApplicationEvents(applicationName)
+      async ({ applicationName }, client) => await client.getApplicationEvents(applicationName)
     );
     this.addJsonOutputTool(
       'get_resource_events',
@@ -158,14 +191,11 @@ export class Server extends McpServer {
         resourceNamespace: z.string(),
         resourceName: z.string()
       },
-      async ({
-        applicationName,
-        applicationNamespace,
-        resourceUID,
-        resourceNamespace,
-        resourceName
-      }) =>
-        await this.argocdClient.getResourceEvents(
+      async (
+        { applicationName, applicationNamespace, resourceUID, resourceNamespace, resourceName },
+        client
+      ) =>
+        await client.getResourceEvents(
           applicationName,
           applicationNamespace,
           resourceUID,
@@ -181,10 +211,10 @@ export class Server extends McpServer {
         applicationNamespace: ApplicationNamespaceSchema,
         resourceRefs: ResourceRefSchema.array().optional()
       },
-      async ({ applicationName, applicationNamespace, resourceRefs }) => {
+      async ({ applicationName, applicationNamespace, resourceRefs }, client) => {
         let refs = resourceRefs || [];
         if (refs.length === 0) {
-          const tree = await this.argocdClient.getApplicationResourceTree(applicationName);
+          const tree = await client.getApplicationResourceTree(applicationName);
           refs =
             tree.nodes?.map((node) => ({
               uid: node.uid!,
@@ -196,9 +226,7 @@ export class Server extends McpServer {
             })) || [];
         }
         return Promise.all(
-          refs.map((ref) =>
-            this.argocdClient.getResource(applicationName, applicationNamespace, ref)
-          )
+          refs.map((ref) => client.getResource(applicationName, applicationNamespace, ref))
         );
       }
     );
@@ -210,8 +238,8 @@ export class Server extends McpServer {
         applicationNamespace: ApplicationNamespaceSchema,
         resourceRef: ResourceRefSchema
       },
-      async ({ applicationName, applicationNamespace, resourceRef }) =>
-        await this.argocdClient.getResourceActions(
+      async ({ applicationName, applicationNamespace, resourceRef }, client) =>
+        await client.getResourceActions(
           applicationName,
           applicationNamespace,
           resourceRef as V1alpha1ResourceResult
@@ -224,18 +252,15 @@ export class Server extends McpServer {
         'create_application',
         'create_application creates a new ArgoCD application in the specified namespace. The application.metadata.namespace field determines where the Application resource will be created (e.g., "argocd", "argocd-apps", or any custom namespace).',
         { application: ApplicationSchema },
-        async ({ application }) =>
-          await this.argocdClient.createApplication(application as V1alpha1Application)
+        async ({ application }, client) =>
+          await client.createApplication(application as V1alpha1Application)
       );
       this.addJsonOutputTool(
         'update_application',
         'update_application updates application',
         { applicationName: z.string(), application: ApplicationSchema },
-        async ({ applicationName, application }) =>
-          await this.argocdClient.updateApplication(
-            applicationName,
-            application as V1alpha1Application
-          )
+        async ({ applicationName, application }, client) =>
+          await client.updateApplication(applicationName, application as V1alpha1Application)
       );
       this.addJsonOutputTool(
         'delete_application',
@@ -254,13 +279,13 @@ export class Server extends McpServer {
             .optional()
             .describe('Deletion propagation policy (e.g., "Foreground", "Background", "Orphan")')
         },
-        async ({ applicationName, applicationNamespace, cascade, propagationPolicy }) => {
+        async ({ applicationName, applicationNamespace, cascade, propagationPolicy }, client) => {
           const options: Record<string, string | boolean> = {};
           if (applicationNamespace) options.appNamespace = applicationNamespace;
           if (cascade !== undefined) options.cascade = cascade;
           if (propagationPolicy) options.propagationPolicy = propagationPolicy;
 
-          return await this.argocdClient.deleteApplication(
+          return await client.deleteApplication(
             applicationName,
             Object.keys(options).length > 0 ? options : undefined
           );
@@ -293,7 +318,10 @@ export class Server extends McpServer {
               'Additional sync options (e.g., ["CreateNamespace=true", "PrunePropagationPolicy=foreground"])'
             )
         },
-        async ({ applicationName, applicationNamespace, dryRun, prune, revision, syncOptions }) => {
+        async (
+          { applicationName, applicationNamespace, dryRun, prune, revision, syncOptions },
+          client
+        ) => {
           const options: Record<string, string | boolean | string[]> = {};
           if (applicationNamespace) options.appNamespace = applicationNamespace;
           if (dryRun !== undefined) options.dryRun = dryRun;
@@ -301,7 +329,7 @@ export class Server extends McpServer {
           if (revision) options.revision = revision;
           if (syncOptions) options.syncOptions = syncOptions;
 
-          return await this.argocdClient.syncApplication(
+          return await client.syncApplication(
             applicationName,
             Object.keys(options).length > 0 ? options : undefined
           );
@@ -316,8 +344,8 @@ export class Server extends McpServer {
           resourceRef: ResourceRefSchema,
           action: z.string()
         },
-        async ({ applicationName, applicationNamespace, resourceRef, action }) =>
-          await this.argocdClient.runResourceAction(
+        async ({ applicationName, applicationNamespace, resourceRef, action }, client) =>
+          await client.runResourceAction(
             applicationName,
             applicationNamespace,
             resourceRef as V1alpha1ResourceResult,
@@ -327,28 +355,75 @@ export class Server extends McpServer {
     }
   }
 
+  // Resolves which ArgoCDClient a single tool call should use: the default
+  // session client when no override is given, or a client built from
+  // resolveServerAuth when one is. The default client's credential is never
+  // reused for an overridden base URL -- an overridden call that can't
+  // resolve its own credential fails outright rather than falling back to
+  // the default, since falling back would let a caller-supplied
+  // argocdBaseUrl (including one echoed back from a prompt-injected tool
+  // result) reach an arbitrary host using the default session's credential.
+  private async resolveClient(argocdBaseUrl: string | undefined): Promise<ArgoCDClient> {
+    if (!argocdBaseUrl) {
+      return this.argocdClient;
+    }
+
+    const cached = this.dynamicClientCache.get(argocdBaseUrl);
+    if (cached) {
+      return cached;
+    }
+
+    if (!this.resolveServerAuth) {
+      throw new Error(
+        'This server does not support targeting a different ArgoCD base URL per call.'
+      );
+    }
+
+    const auth = await this.resolveServerAuth(argocdBaseUrl);
+    if (!auth) {
+      throw new Error(
+        `No stored login found for "${argocdBaseUrl}". Run \`argocd-mcp login ${argocdBaseUrl}\` first.`
+      );
+    }
+
+    const client = new ArgoCDClient({
+      baseUrl: auth.baseUrl,
+      apiToken: auth.apiToken,
+      tokenRefreshProvider: createTokenRefreshProvider(auth.baseUrl)
+    });
+    this.dynamicClientCache.set(argocdBaseUrl, client);
+    return client;
+  }
+
   private addJsonOutputTool<Args extends ZodRawShape, T>(
     name: string,
     description: string,
     paramsSchema: Args,
-    cb: (...cbArgs: Parameters<ToolCallback<Args>>) => T
+    cb: (args: Parameters<ToolCallback<Args>>[0], client: ArgoCDClient) => T
   ) {
-    this.tool(name, description, paramsSchema as ZodRawShape, async (...args) => {
-      // Check authentication before executing tool
-      if (!this.isAuthenticated) {
+    const mergedSchema = { ...paramsSchema, ...dynamicServerArgsSchema } as ZodRawShape;
+    this.tool(name, description, mergedSchema, async (...args) => {
+      const allArgs = args[0] as Parameters<ToolCallback<Args>>[0] & DynamicServerArgs;
+      const { argocdBaseUrl, ...toolArgs } = allArgs;
+
+      // Check authentication before executing tool -- but only when no
+      // per-call override was given. A server with no default session must
+      // still be usable purely via argocdBaseUrl.
+      if (!argocdBaseUrl && !this.isAuthenticated) {
         return {
           isError: true,
           content: [
             {
               type: 'text',
-              text: 'Not authenticated. Please run `argocd-mcp login <server-url>` to authenticate via SSO, or set ARGOCD_BASE_URL and ARGOCD_API_TOKEN environment variables.'
+              text: 'Not authenticated. Please run `argocd-mcp login <server-url>` to authenticate via SSO, set ARGOCD_BASE_URL and ARGOCD_API_TOKEN environment variables, or pass argocdBaseUrl to target a server you have already logged into.'
             }
           ]
         };
       }
 
       try {
-        const result = await cb.apply(this, args as Parameters<ToolCallback<Args>>);
+        const client = await this.resolveClient(argocdBaseUrl);
+        const result = await cb.call(this, toolArgs as Parameters<ToolCallback<Args>>[0], client);
         return {
           isError: false,
           content: [{ type: 'text', text: JSON.stringify(result) }]

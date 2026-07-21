@@ -11,6 +11,10 @@ export interface TokenRefreshProvider {
  * Create a token refresh provider for a server URL.
  * The provider loads stored auth, fetches OIDC metadata, refreshes the token,
  * and saves the new token to the store.
+ *
+ * Returns the refreshed ID token, not the access token: ArgoCD validates the
+ * bearer credential's `aud` claim against its own client ID, which the OIDC
+ * spec only guarantees for the ID token.
  */
 export function createTokenRefreshProvider(serverUrl: string): TokenRefreshProvider {
   return {
@@ -43,7 +47,11 @@ export function createTokenRefreshProvider(serverUrl: string): TokenRefreshProvi
           );
           await saveToken(serverUrl, newToken, oidcConfig);
           logger.info({ serverUrl }, 'Access token refreshed successfully');
-          return newToken.accessToken;
+          if (!newToken.idToken) {
+            logger.warn({ serverUrl }, 'Refresh response had no ID token');
+            return null;
+          }
+          return newToken.idToken;
         } catch {
           // If refresh fails, try re-fetching OIDC settings from server (config may have changed)
           logger.debug(
@@ -61,7 +69,11 @@ export function createTokenRefreshProvider(serverUrl: string): TokenRefreshProvi
           );
           await saveToken(serverUrl, newToken, oidcConfig);
           logger.info({ serverUrl }, 'Access token refreshed with updated OIDC config');
-          return newToken.accessToken;
+          if (!newToken.idToken) {
+            logger.warn({ serverUrl }, 'Refresh response had no ID token');
+            return null;
+          }
+          return newToken.idToken;
         }
       } catch (error) {
         logger.error(
